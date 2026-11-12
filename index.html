@@ -206,5 +206,208 @@ const ytApi = new Promise(res => {
 });
 const ytErrMsg = {
   2: 'Link de video inválido.', 5: 'Error del reproductor HTML5.', 100: 'Video no encontrado o privado.',
-  101: 'El dueño del video no permite reproducirlo
+  101: 'El dueño del video no permite reproducirlo fuera de YouTube. Usa otro karaoke.',
+  150: 'El dueño del video no permite reproducirlo fuera de YouTube. Usa otro karaoke.',
+  153: 'YouTube rechazó el origen de la página. Aloja el archivo en HTTPS (no lo abras como archivo local).'
+};
+function showYtErr(m){ const e = $('ytErr'); e.textContent = m; e.classList.remove('hide'); }
 
+async function loadVideo(id){
+  await ytApi;
+  if(!window.YT || !YT.Player) throw new Error('No se pudo cargar la API de YouTube (¿sin internet o bloqueada?).');
+  if(yt){ yt.cueVideoById(id); return; }
+  await new Promise(res => {
+    yt = new YT.Player('ytp', {
+      videoId: id, width: '100%', height: '100%',
+      playerVars: { playsinline: 1, rel: 0, modestbranding: 1, origin: location.origin === 'null' ? undefined : location.origin },
+      events: {
+        onReady: () => { ytReady = true; res(); },
+        onError: e => showYtErr(ytErrMsg[e.data] || ('Error de YouTube ' + e.data))
+      }
+    });
+  });
+}
+
+// ---------- configuración ----------
+$('goBtn').onclick = async () => {
+  const err = $('setupErr'); err.classList.add('hide');
+  const v = parseYT($('url').value);
+  const names = $('names').value.split(',').map(s => s.trim()).filter(Boolean);
+  const bad = m => { err.textContent = m; err.classList.remove('hide'); };
+  if(!v) return bad('Link de YouTube no válido.');
+  if(!names.length) return bad('Escribe al menos un jugador.');
+  const dur = Math.max(15, Math.min(180, +$('dur').value || 45));
+  const start = parseTime($('start').value) || v.t || 0;
+  cfg = { id: v.id, start, dur, mode: $('mode').value, rounds: Math.max(1, Math.min(5, +$('rounds').value || 1)) };
+  players = names.map(n => ({ name: n, scores: [] }));
+  turn = 0; totalTurns = players.length * cfg.rounds;
+  $('goBtn').disabled = true; $('goBtn').textContent = 'Cargando…';
+  try{ await loadVideo(cfg.id); }catch(e){ $('goBtn').disabled = false; $('goBtn').textContent = 'Cargar y empezar'; return bad(e.message); }
+  $('goBtn').disabled = false; $('goBtn').textContent = 'Cargar y empezar';
+  $('setup').classList.add('hide'); $('game').classList.remove('hide');
+  prepareTurn();
+};
+
+function segFor(t){
+  let dur = cfg.dur, start = cfg.start;
+  if(cfg.mode === 'seq') start = cfg.start + t * dur;
+  const total = ytReady && yt.getDuration ? yt.getDuration() : 0;
+  if(total > 0){
+    if(start >= total - 10) start = cfg.start;
+    if(start + dur > total) dur = Math.max(10, total - start);
+  }
+  return { start, end: start + dur };
+}
+
+function prepareTurn(){
+  ['liveCard', 'resCard'].forEach(i => $(i).classList.add('hide'));
+  $('turnCard').classList.remove('hide'); $('micErr').classList.add('hide');
+  const p = players[turn % players.length];
+  const round = Math.floor(turn / players.length) + 1;
+  const seg = segFor(turn);
+  $('who').textContent = 'Turno de ' + p.name;
+  $('segInfo').textContent = 'Ronda ' + round + '/' + cfg.rounds + ' · tramo ' + fmt(seg.start) + ' – ' + fmt(seg.end);
+  drawBoard();
+}
+
+// ---------- micrófono ----------
+async function initMic(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    throw new Error('Este navegador/página no permite micrófono. Necesitas HTTPS.');
+  if(!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+  await ac.resume();
+  if(stream) return;
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
+  const src = ac.createMediaStreamSource(stream);
+  an = ac.createAnalyser(); an.fftSize = 2048; an.smoothingTimeConstant = 0;
+  src.connect(an); // NO se conecta a destination: evita retroalimentación
+}
+
+// ---------- turno ----------
+$('singBtn').onclick = async () => {
+  const me = $('micErr'); me.classList.add('hide');
+  if(!ytReady) return;
+  try{ await initMic(); }
+  catch(e){
+    me.textContent = e.name === 'NotAllowedError' ? 'Permiso de micrófono denegado. Actívalo en los ajustes del navegador para este sitio.' : e.message;
+    me.classList.remove('hide'); return;
+  }
+  const seg = segFor(turn);
+  run = { start: seg.start, end: seg.end, frames: 0, midis: [], trace: [], ambient: [], gate: 0.012, waited: 0 };
+  $('turnCard').classList.add('hide'); $('liveCard').classList.remove('hide');
+  $('noteTxt').textContent = '--'; $('noteSub').innerHTML = '&nbsp;'; $('prog').style.width = '0';
+  yt.seekTo(seg.start, true); yt.playVideo();
+  timer = setInterval(tick, 33);
+};
+$('stopBtn').onclick = () => finishTurn();
+
+function tick(){
+  if(!run) return;
+  an.getFloatTimeDomainData(buf);
+  let s = 0; for(let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+  const rms = Math.sqrt(s / buf.length);
+  const st = yt.getPlayerState(), t = yt.getCurrentTime();
+  const playing = st === 1 && t >= run.start - 0.3;
+
+  if(!playing){
+    // ruido ambiente para calibrar la compuerta
+    if(run.ambient.length < 30) run.ambient.push(rms);
+    run.waited++;
+    if(run.waited > 600){ // ~20 s sin arrancar
+      showYtErr('El video no arrancó. Revisa conexión o prueba otro link.'); return finishTurn(true);
+    }
+    return;
+  }
+  if(run.ambient.length >= 5 && !run.gateSet){
+    const a = run.ambient.reduce((x, y) => x + y, 0) / run.ambient.length;
+    run.gate = Math.max(0.012, a * 2.5); run.gateSet = true;
+  }
+  if(t >= run.end || st === 0) return finishTurn();
+
+  run.frames++;
+  $('prog').style.width = Math.min(100, 100 * (t - run.start) / (run.end - run.start)) + '%';
+  let m = null;
+  if(rms >= run.gate){
+    const r = yin(buf, ac.sampleRate, 70, 1000, 0.15);
+    if(r && r.clarity >= 0.85){ m = freqToMidi(r.freq); run.midis.push(m); }
+  }
+  run.trace.push({ ts: performance.now(), m });
+  if(run.trace.length > 400) run.trace.shift();
+  if(m !== null){
+    const r = Math.round(m), c = Math.round((m - r) * 100);
+    $('noteTxt').textContent = NOMBRES[((r % 12) + 12) % 12] + Math.floor(r / 12 - 1);
+    $('noteTxt').style.color = Math.abs(c) <= 25 ? 'var(--ok)' : 'var(--warn)';
+    $('noteSub').textContent = (c > 0 ? '+' : '') + c + ' cents';
+  }else{
+    $('noteTxt').textContent = '--'; $('noteTxt').style.color = ''; $('noteSub').innerHTML = '&nbsp;';
+  }
+  drawTrace();
+}
+
+function drawTrace(){
+  const cv = $('trace'), dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if(cv.width !== w * dpr){ cv.width = w * dpr; cv.height = h * dpr; }
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  const now = performance.now(), win = 6000;
+  const pts = run.trace.filter(p => p.m !== null && now - p.ts < win);
+  if(!pts.length) return;
+  let lo = Math.min(...pts.map(p => p.m)) - 2, hi = Math.max(...pts.map(p => p.m)) + 2;
+  if(hi - lo < 12){ const c = (hi + lo) / 2; lo = c - 6; hi = c + 6; }
+  g.strokeStyle = '#2c2e57'; g.lineWidth = 1;
+  for(let n = Math.ceil(lo); n <= hi; n++){ const y = h - (n - lo) / (hi - lo) * h; g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); }
+  for(const p of pts){
+    const x = w - (now - p.ts) / win * w, y = h - (p.m - lo) / (hi - lo) * h;
+    g.fillStyle = Math.abs(p.m - Math.round(p.m)) <= 0.25 ? '#3ddc97' : '#ffb84d';
+    g.beginPath(); g.arc(x, y, 3, 0, 7); g.fill();
+  }
+}
+
+function finishTurn(aborted){
+  clearInterval(timer); timer = null;
+  try{ yt.pauseVideo(); }catch(e){}
+  const r = run; run = null;
+  $('liveCard').classList.add('hide');
+  if(aborted){ prepareTurn(); return; }
+  const res = scoreFrames(r.frames, r.midis);
+  const p = players[turn % players.length];
+  p.scores.push(res.score);
+  $('resWho').textContent = p.name;
+  $('resScore').textContent = res.score;
+  const bar = (l, v) => '<div class="m"><span>' + l + '</span><span>' + Math.round(v * 100) + '%</span></div><div class="bar"><i style="width:' + (v * 100) + '%"></i></div>';
+  $('resBars').innerHTML = bar('Afinación', res.tune) + bar('Tonalidad', res.key) + bar('Cobertura (multiplica el total)', res.cov);
+  const rn = $('resNote');
+  if(res.tooShort){ rn.textContent = 'Casi no se detectó voz. Revisa el micrófono, acércate y usa audífonos.'; rn.classList.remove('hide'); } else rn.classList.add('hide');
+  $('resCard').classList.remove('hide');
+  $('nextBtn').textContent = (turn + 1 >= totalTurns) ? 'Ver resultado final' : 'Siguiente jugador';
+  drawBoard();
+}
+
+$('nextBtn').onclick = () => {
+  turn++;
+  if(turn >= totalTurns) return showFinal();
+  prepareTurn();
+};
+
+function avg(a){ return a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0; }
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function drawBoard(){
+  const rows = players.map(p => ({ n: p.name, s: p.scores, a: avg(p.scores) })).sort((x, y) => y.a - x.a);
+  $('board').innerHTML = '<tr><th>Jugador</th><th>Turnos</th><th class="n">Prom.</th></tr>' +
+    rows.map(r => '<tr><td>' + esc(r.n) + '</td><td>' + (r.s.join(' · ') || '—') + '</td><td class="n"><b>' + Math.round(r.a) + '</b></td></tr>').join('');
+}
+
+function showFinal(){
+  ['turnCard', 'liveCard'].forEach(i => $(i).classList.add('hide'));
+  const rows = players.map(p => ({ n: p.name, a: avg(p.scores) })).sort((x, y) => y.a - x.a);
+  $('resWho').textContent = '🏆 Ganador: ' + rows[0].n;
+  $('resScore').textContent = Math.round(rows[0].a);
+  $('resBars').innerHTML = ''; $('resNote').classList.add('hide');
+  $('nextBtn').textContent = 'Jugar de nuevo';
+  $('nextBtn').onclick = () => location.reload();
+  $('resCard').classList.remove('hide');
+  drawBoard();
+}
+</script>
+</body>
+</html>
